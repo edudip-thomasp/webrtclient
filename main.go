@@ -2,12 +2,22 @@ package main
 
 import (
         "flag"
-        "fmt"
-        "github.com/pion/webrtc/v3"
         "github.com/gorilla/websocket"
+        "github.com/pion/webrtc/v3"
         "log"
         "net/url"
+        "encoding/json"
 )
+
+func sdpToByteslice(sdp webrtc.SessionDescription) ([]byte, error) {
+        return json.Marshal(sdp)
+}
+
+func bytesliceToSDP(sdpBs []byte) (*webrtc.SessionDescription, error) {
+        sdp := &webrtc.SessionDescription{}
+        return sdp, json.Unmarshal(sdpBs, sdp)
+}
+
 
 func connectToWebsocket() *websocket.Conn  {
         url := url.URL {
@@ -63,36 +73,55 @@ func main() {
                 panic(errPeerConnection)
         }
 
-        myOffer, errCreateOffer := peerConnection.CreateOffer(&webrtc.OfferOptions{})
-
-        if errCreateOffer != nil {
-                panic(errCreateOffer)
-        }
-
-        peerConnection.SetLocalDescription(myOffer)
-        myOfferStr := fmt.Sprintf("%s", myOffer)
-        myOfferBs := []byte(myOfferStr)
-
         websocketConn := connectToWebsocket()
+        var sentMsg []byte
+        var recvdMsg []byte
 
         if iAmInitiator {
                 log.Println("I am the initiator...")
-                // TODO: send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the second client/peer
+
+                myOffer, errCreateOffer := peerConnection.CreateOffer(&webrtc.OfferOptions{})
+
+                if errCreateOffer != nil {
+                        panic(errCreateOffer)
+                }
+
+                peerConnection.SetLocalDescription(myOffer)
+                myOfferBs, _ := sdpToByteslice(myOffer)
+
+                // send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the second client/peer
                 log.Println("Send myOffer (SDP) to websocket server that relays it to second client.")
-                sentMsg := sendMsgWebsocket(websocketConn, myOfferBs)
+                sentMsg = sendMsgWebsocket(websocketConn, myOfferBs)
                 log.Printf("v+%", sentMsg)
 
-                for{}
-                // TODO: Listen on websocket server localhost:8889 for offer (SDP)
-                log.Println("Listen for response offer.")
+                // Listen on websocket server localhost:8889 for offer (SDP)
+                log.Println("Listen for answer.")
+                recvdMsg = recvMsgWebsocket(websocketConn)
+                log.Printf("Got answer from receiver: %v\n", recvdMsg)
+                // Process answer
+                answer, _ := bytesliceToSDP(recvdMsg)
+                peerConnection.SetRemoteDescription(*answer)
         } else {
                 log.Println("I am the receiver..")
-                // TODO: Listen on websocket server localhost:8889 for initiator's offer (SDP)
-                recvdMsg := recvMsgWebsocket(websocketConn)
+                // Listen on websocket server localhost:8889 for initiator's offer (SDP)
+                recvdMsg = recvMsgWebsocket(websocketConn)
                 log.Printf("v+%", recvdMsg)
 
                 log.Println("Listen for initiator's offer.")
-                // TODO: send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the initiator
+                // send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the initiator
                 log.Println("Send myOffer (SDP) to websocket server that relays it to the initiator.")
+                offer, _ := bytesliceToSDP(recvdMsg)
+                peerConnection.SetRemoteDescription(*offer)
+
+                myAnswer, answErr := peerConnection.CreateAnswer(&webrtc.AnswerOptions{})
+
+                if answErr != nil {
+                        panic(answErr)
+                }
+
+                myAnswerBs, _ := sdpToByteslice(myAnswer)
+
+                sentMsg = sendMsgWebsocket(websocketConn, myAnswerBs)
+                log.Printf("Answer sent...\nContent: %v\n", myAnswerBs)
         }
 }
