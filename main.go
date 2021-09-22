@@ -1,13 +1,20 @@
 package main
 
 import (
-        "flag"
-        "github.com/gorilla/websocket"
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"github.com/gorilla/websocket"
         "github.com/pion/webrtc/v3"
         "log"
         "net/url"
-        "encoding/json"
 )
+
+type clientSDPs struct {
+	offer webrtc.SessionDescription
+	answer webrtc.SessionDescription
+}
 
 func sdpToByteslice(sdp webrtc.SessionDescription) ([]byte, error) {
         return json.Marshal(sdp)
@@ -45,7 +52,7 @@ func sendMsgWebsocket(conn *websocket.Conn, msg []byte) []byte {
         return msg
 }
 
-func recvMsgWebsocket(conn *websocket.Conn) []byte {
+func recvMsgWebsocketNonBlocking(conn *websocket.Conn) []byte {
         _, msg, readMsgErr := conn.ReadMessage()
 
         if readMsgErr != nil {
@@ -54,74 +61,173 @@ func recvMsgWebsocket(conn *websocket.Conn) []byte {
 
         return msg
 }
+func recvMsgWebsocketBlocking(conn *websocket.Conn, done chan *webrtc.SessionDescription) *webrtc.SessionDescription {
+	defer close(done)
+	_, msg, readMsgErr := conn.ReadMessage()
+
+	if readMsgErr != nil {
+		panic(readMsgErr)
+	}
+
+	msgSDP, convByteSliceToSDPMsgErr := bytesliceToSDP(msg)
+
+	if convByteSliceToSDPMsgErr != nil {
+		panic(convByteSliceToSDPMsgErr)
+	}
+
+	done <- msgSDP
+
+	return msgSDP
+}
+
+
+func onPeerConnCloseDetectErr(peerConnection *webrtc.PeerConnection) {
+        if cErr := peerConnection.Close(); cErr != nil {
+                log.Printf("cannot close peerConnection: %v\n", cErr)
+        }
+        log.Println("Everything is fine. Closing peer connection.")
+}
+
+func execInitiatorsSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerConnection) *clientSDPs {
+	onPeerConnCloseDetectErr(peerConnection)
+	localOffer, createOfferErr := peerConnection.CreateOffer(&webrtc.OfferOptions{})
+	//localOffer.Type = 1
+
+	if createOfferErr != nil {
+		log.Printf("API: Error creating offer! Content: %+v\n", localOffer)
+		panic(createOfferErr)
+	}
+
+	errSetLocalDescr := peerConnection.SetLocalDescription(localOffer)
+
+	if errSetLocalDescr != nil {
+		log.Println("API: Error setting local descr (offer)!")
+		panic(errSetLocalDescr)
+	}
+
+	offerByteSlice, sdpToBytesliceErr := sdpToByteslice(localOffer)
+
+	if sdpToBytesliceErr != nil {
+		log.Printf("WebRTCClient: Error setting local descr (offer)! Content: %+v\n", offerByteSlice)
+		panic(sdpToBytesliceErr)
+	}
+
+	// Handling OnICECandidate event
+	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate != nil {
+			reqBodyBytes := new(bytes.Buffer)
+			json.NewEncoder(reqBodyBytes).Encode(candidate)
+
+			messageBytes := reqBodyBytes.Bytes()
+			sendMsgWebsocket(c, messageBytes)
+		}
+	})
+
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		fmt.Printf("Connection State has changed to %s \n", connectionState.String())
+	})
+
+	done := make(chan *webrtc.SessionDescription)
+	go recvMsgWebsocketBlocking(c, done)
+	remoteAnswer := *(<-done)
+
+	log.Printf("Remote answer received (before setting it!): %+v\n", remoteAnswer)
+
+	errSetRemoteDescr := peerConnection.SetRemoteDescription(remoteAnswer)
+
+	if errSetRemoteDescr != nil {
+		log.Printf("API: Error setting remote descr (answer)! Content: %+v\n", remoteAnswer)
+		panic(errSetRemoteDescr)
+	}
+
+	log.Printf("Remote answer received (after setting it!): %+v\n", remoteAnswer)
+
+    return &clientSDPs{
+    	offer: localOffer,
+    	answer: remoteAnswer,
+	}
+}
+func execReceiversSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerConnection) *clientSDPs {
+    done := make(chan *webrtc.SessionDescription)
+    go recvMsgWebsocketBlocking(c, done)
+    remoteOffer := *(<-done)
+
+	onPeerConnCloseDetectErr(peerConnection)
+
+	errSetRemoteDescr := peerConnection.SetRemoteDescription(remoteOffer)
+
+	if errSetRemoteDescr != nil {
+		log.Printf("API: Error setting remote descr (offer)! Content: %+v\n", remoteOffer)
+		panic(errSetRemoteDescr)
+	}
+
+	localAnswer, createAnswerErr := peerConnection.CreateAnswer(&webrtc.AnswerOptions{})
+	//localOffer.Type = 1
+
+	if createAnswerErr != nil {
+		log.Printf("API: Error creating local answer! Content: %+v\n", localAnswer)
+		panic(createAnswerErr)
+	}
+
+	// Handling OnICECandidate event
+	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate != nil {
+			reqBodyBytes := new(bytes.Buffer)
+			json.NewEncoder(reqBodyBytes).Encode(candidate)
+
+			messageBytes := reqBodyBytes.Bytes()
+			sendMsgWebsocket(c, messageBytes)
+		}
+	})
+
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		fmt.Printf("Connection State has changed to %s \n", connectionState.String())
+	})
+
+	errSetLocalAnswer := peerConnection.SetLocalDescription(localAnswer)
+
+	if errSetLocalAnswer != nil {
+		log.Printf("API: Error setting local descr (answer)! Content: %+v\n", localAnswer)
+		panic(errSetLocalAnswer)
+	}
+
+	return &clientSDPs{
+		offer: localAnswer,
+		answer: remoteOffer,
+	}
+}
+
 
 func main() {
-        pIAmInitiator := flag.Bool("initiator", false, "Set intiator mode")
-        pIAmReceiver := flag.Bool("receiver", false, "Set receiver mode")
-        flag.Parse()
+	pIAmInitiator := flag.Bool("initiator", false, "Set intiator mode")
+	pIAmReceiver := flag.Bool("receiver", false, "Set receiver mode")
+	flag.Parse()
 
-        iAmInitiator := *pIAmInitiator
-        iAmReceiver := *pIAmReceiver
+	iAmInitiator := *pIAmInitiator
+	iAmReceiver := *pIAmReceiver
 
-        if iAmInitiator && iAmReceiver {
-                panic("You must not provide both --initiator and --receiver flag. Aborting. Bye!")
-        }
+	if iAmInitiator && iAmReceiver {
+		panic("You must not provide both --initiator and --receiver flag. Aborting. Bye!")
+	}
 
-        peerConnection, errPeerConnection := webrtc.NewPeerConnection(webrtc.Configuration{})
+    c := connectToWebsocket()
 
-        if errPeerConnection != nil {
-                panic(errPeerConnection)
-        }
+	peerConnection, newPeerConnErr := webrtc.NewPeerConnection(webrtc.Configuration{})
 
-        websocketConn := connectToWebsocket()
-        var sentMsg []byte
-        var recvdMsg []byte
+	if newPeerConnErr != nil {
+	    log.Printf("API: Error creating new peer connection! Content: %+v\n", peerConnection)
+		panic(newPeerConnErr)
+	}
 
-        if iAmInitiator {
-                log.Println("I am the initiator...")
-
-                myOffer, errCreateOffer := peerConnection.CreateOffer(&webrtc.OfferOptions{})
-
-                if errCreateOffer != nil {
-                        panic(errCreateOffer)
-                }
-
-                peerConnection.SetLocalDescription(myOffer)
-                myOfferBs, _ := sdpToByteslice(myOffer)
-
-                // send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the second client/peer
-                log.Println("Send myOffer (SDP) to websocket server that relays it to second client.")
-                sentMsg = sendMsgWebsocket(websocketConn, myOfferBs)
-                log.Printf("v+%", sentMsg)
-
-                // Listen on websocket server localhost:8889 for offer (SDP)
-                log.Println("Listen for answer.")
-                recvdMsg = recvMsgWebsocket(websocketConn)
-                log.Printf("Got answer from receiver: %v\n", recvdMsg)
-                // Process answer
-                answer, _ := bytesliceToSDP(recvdMsg)
-                peerConnection.SetRemoteDescription(*answer)
-        } else {
-                log.Println("I am the receiver..")
-                // Listen on websocket server localhost:8889 for initiator's offer (SDP)
-                recvdMsg = recvMsgWebsocket(websocketConn)
-                log.Printf("v+%", recvdMsg)
-
-                log.Println("Listen for initiator's offer.")
-                // send myOffer (SDP) to a websocket server on localhost:8889 that relays it to the initiator
-                log.Println("Send myOffer (SDP) to websocket server that relays it to the initiator.")
-                offer, _ := bytesliceToSDP(recvdMsg)
-                peerConnection.SetRemoteDescription(*offer)
-
-                myAnswer, answErr := peerConnection.CreateAnswer(&webrtc.AnswerOptions{})
-
-                if answErr != nil {
-                        panic(answErr)
-                }
-
-                myAnswerBs, _ := sdpToByteslice(myAnswer)
-
-                sentMsg = sendMsgWebsocket(websocketConn, myAnswerBs)
-                log.Printf("Answer sent...\nContent: %v\n", myAnswerBs)
-        }
+	if iAmInitiator {
+		sdps := execInitiatorsSDPSignaling(c, peerConnection)
+		log.Printf("Initiator: SDPs: %+v\n", sdps)
+	} else if iAmReceiver {
+		sdps := execReceiversSDPSignaling(c, peerConnection)
+		log.Printf("Receiver: SDPs: %+v\n", sdps)
+	} else {
+		panic("You must provide the -initiator or -receiver flag to select mode. Receiver always must connect first!")
+	}
 }
+
+
