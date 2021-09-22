@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"github.com/gorilla/websocket"
-        "github.com/pion/webrtc/v3"
-        "log"
-        "net/url"
+	"github.com/pion/webrtc/v3"
+	"log"
+	"net/url"
 )
 
 type clientSDPs struct {
@@ -98,7 +96,9 @@ func execInitiatorsSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerCo
 		panic(createOfferErr)
 	}
 
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 	errSetLocalDescr := peerConnection.SetLocalDescription(localOffer)
+	<-gatherComplete
 
 	if errSetLocalDescr != nil {
 		log.Println("API: Error setting local descr (offer)!")
@@ -111,21 +111,6 @@ func execInitiatorsSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerCo
 		log.Printf("WebRTCClient: Error setting local descr (offer)! Content: %+v\n", offerByteSlice)
 		panic(sdpToBytesliceErr)
 	}
-
-	// Handling OnICECandidate event
-	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			reqBodyBytes := new(bytes.Buffer)
-			json.NewEncoder(reqBodyBytes).Encode(candidate)
-
-			messageBytes := reqBodyBytes.Bytes()
-			sendMsgWebsocket(c, messageBytes)
-		}
-	})
-
-	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		fmt.Printf("Connection State has changed to %s \n", connectionState.String())
-	})
 
 	done := make(chan *webrtc.SessionDescription)
 	go recvMsgWebsocketBlocking(c, done)
@@ -169,27 +154,19 @@ func execReceiversSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerCon
 		panic(createAnswerErr)
 	}
 
-	// Handling OnICECandidate event
-	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			reqBodyBytes := new(bytes.Buffer)
-			json.NewEncoder(reqBodyBytes).Encode(candidate)
-
-			messageBytes := reqBodyBytes.Bytes()
-			sendMsgWebsocket(c, messageBytes)
-		}
-	})
-
-	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		fmt.Printf("Connection State has changed to %s \n", connectionState.String())
-	})
+	// Create channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 
 	errSetLocalAnswer := peerConnection.SetLocalDescription(localAnswer)
+	<-gatherComplete
 
 	if errSetLocalAnswer != nil {
 		log.Printf("API: Error setting local descr (answer)! Content: %+v\n", localAnswer)
 		panic(errSetLocalAnswer)
 	}
+
+	localAnswerByteSlice, _ := sdpToByteslice(localAnswer)
+	sendMsgWebsocket(c, localAnswerByteSlice)
 
 	return &clientSDPs{
 		offer: localAnswer,
@@ -199,7 +176,7 @@ func execReceiversSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerCon
 
 
 func main() {
-	pIAmInitiator := flag.Bool("initiator", false, "Set intiator mode")
+	pIAmInitiator := flag.Bool("initiator", false, "Set initiator mode")
 	pIAmReceiver := flag.Bool("receiver", false, "Set receiver mode")
 	flag.Parse()
 
