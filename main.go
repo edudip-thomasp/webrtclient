@@ -190,6 +190,9 @@ func execReceiversSDPSignaling(c *websocket.Conn, peerConnection *webrtc.PeerCon
 		log.Printf("API: Error setting local descr (answer)! Content: %+v\n", localAnswer)
 		panic(errSetLocalAnswer)
 	}
+	
+	localAnswerByteSlice, _ := sdpToByteslice(localAnswer)
+	sendMsgWebsocket(c, localAnswerByteSlice)
 
 	return &clientSDPs{
 		offer: localAnswer,
